@@ -1,0 +1,1596 @@
+---
+title: "Final Code Workflow for Buffer Strategy 1"
+date: "June 16, 2026"
+date-format: long
+format: html
+editor: visual
+---
+
+## Loadings
+
+```{r libs, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(pROC)        
+library(ROCR)
+library(spdep)
+library(corrplot)
+library(car)
+library(grpreg)     
+library(dplyr)
+library(caret)
+library(nortest)
+library(DescTools)
+library(PRROC)
+library(caret)
+#Libraries for mapping
+library(sf)
+library(raster)
+library(glmnet)
+library(sp)
+library(classInt)
+library(gstat)
+```
+
+## 1A Data Preparation
+
+```{r Data Strategy 1}
+data <- read.csv("Buffer-Strategy-1.csv")
+```
+
+```{r Standardization}
+target_predictors <- c("Elev", "Slope", "PGAComp", "HorizontalCurvature", "VerticalCurvature")
+data[, target_predictors] <- scale(data[, target_predictors])
+data <- data |> mutate(
+  Aspect = as.factor(Aspect),
+  Lithology = as.factor(Lithology),
+  SoilType = as.factor(SoilType)
+)
+```
+
+
+
+
+## 1B Diagnostic Checking
+
+```{r Normality test}
+# Shapiro-Wilk test
+shapiro.test(data$Elev)
+shapiro.test(data$Slope)
+shapiro.test(data$HorizontalCurvature)
+shapiro.test(data$VerticalCurvature)
+shapiro.test(data$PGAComp)
+
+# Anderson-Darling test
+ad.test(data$Elev)
+ad.test(data$Slope)
+ad.test(data$HorizontalCurvature)
+ad.test(data$VerticalCurvature)
+ad.test(data$PGAComp)
+```
+
+```{r Correlation Categorical Vars, warning= FALSE}
+chisq.test(table(data$Aspect, data$Lithology))
+CramerV(table(data$Aspect, data$Lithology))
+chisq.test(table(data$Aspect, data$SoilType))
+CramerV(table(data$Aspect, data$SoilType))
+chisq.test(table(data$SoilType, data$Lithology))
+CramerV(table(data$SoilType, data$Lithology))
+```
+
+```{r Correlation Numerical Vars}
+cor_matrix <- cor(data[, 
+                       c("Slope","Elev","HorizontalCurvature","VerticalCurvature","PGAComp")],
+                  method = "spearman")
+
+corrplot(cor_matrix, method="number", tl.cex=0.8)
+```
+
+
+## 1C Model Building
+
+### 1C.0
+
+```{r Data Split}
+set.seed(123) 
+train_index <- createDataPartition(data$Landslide, p = 0.8, list = FALSE)
+train_data <- data[train_index, ]
+test_data <- data[-train_index, ]
+```
+
+```{r Compute for Reference Level}
+# Function to compute LS rate per category
+ls_rate <- function(var, data) {
+  aggregate(data$Landslide, 
+            by = list(Category = data[[var]]), 
+            FUN = function(x) sum(x) / length(x))
+}
+
+# Aspect
+aspect_rates <- ls_rate("Aspect", train_data)
+colnames(aspect_rates)[2] <- "LS_rate"
+print(aspect_rates[order(aspect_rates$LS_rate), ])
+
+# Lithology
+lithology_rates <- ls_rate("Lithology", train_data)
+colnames(lithology_rates)[2] <- "LS_rate"
+print(lithology_rates[order(lithology_rates$LS_rate), ])
+
+# SoilType
+soiltype_rates <- ls_rate("SoilType", train_data)
+colnames(soiltype_rates)[2] <- "LS_rate"
+print(soiltype_rates[order(soiltype_rates$LS_rate), ])
+```
+
+```{r Reference Level}
+train_data$Aspect    <- relevel(train_data$Aspect, ref = "North")
+train_data$Lithology <- relevel(train_data$Lithology, ref = "Recent deposits")
+train_data$SoilType  <- relevel(train_data$SoilType, ref = "Loam")    
+```
+
+```{r X_train y_train}
+X_train <- model.matrix(Landslide ~ Elev + Slope + PGAComp + 
+                     VerticalCurvature + HorizontalCurvature + 
+                     Aspect + Lithology + SoilType, 
+                     data = train_data)[, -1]  
+y_train <- train_data$Landslide
+```
+
+```{r X_test y_test}
+X_test  <- model.matrix(Landslide ~ Elev + Slope + PGAComp + 
+                     VerticalCurvature + HorizontalCurvature + 
+                     Aspect + Lithology + SoilType, data = test_data)[, -1]
+y_test  <- test_data$Landslide
+```
+
+```{r group}
+cols <- colnames(X_train)
+
+group <- integer(length(cols))
+
+group[grep("^Elev$", cols)]                <- 1
+group[grep("^Slope$", cols)]               <- 2
+group[grep("^PGAComp$", cols)]             <- 3
+group[grep("^HorizontalCurvature$", cols)] <- 4
+group[grep("^VerticalCurvature$", cols)]   <- 5
+group[grep("^Aspect", cols)]     <- 6
+group[grep("^Lithology", cols)]  <- 7
+group[grep("^SoilType", cols)]   <- 8
+
+table(group)
+cbind(cols, group)
+```
+
+### 1C.1 Benchmark Model
+
+```{r standard lr}
+benchmark_model <- glm(Landslide ~ Elev + Slope + PGAComp + 
+                     VerticalCurvature + HorizontalCurvature + 
+                     Aspect + Lithology + SoilType, 
+                     data = train_data, family = "binomial")
+```
+
+### 1C.2 Proposed Model: grLASSO
+
+```{r grLASSO lr}
+# Fit Group LASSO logistic regression
+fit_grLASSO <- grpreg(
+  X_train, y_train,
+  group = group,
+  penalty = "grLasso",
+  family = "binomial"
+)
+
+# Cross-validation to select λ
+set.seed(123)
+cvfit_grLASSO <- cv.grpreg(
+  X_train, y_train,
+  group = group,
+  penalty = "grLasso",  
+  family = "binomial",
+  seed = 123
+)
+
+lambda_min_grLASSO <- cvfit_grLASSO$lambda.min
+cvfit_grLASSO |> plot()
+lambda_min_grLASSO
+
+coef_min_grLASSO <- coef(cvfit_grLASSO, lambda = lambda_min_grLASSO)
+coef_min_grLASSO
+```
+
+### 1C.3 Proposed Model: grSCAD 
+
+```{r grSCAD lr}
+# Fit Group LASSO logistic regression
+fit_scad <- grpreg(
+  X_train, y_train,
+  group = group,
+  penalty = "grSCAD",
+  family = "binomial"
+)
+
+# Cross-validation to select λ
+set.seed(123)
+cvfit_scad <- cv.grpreg(
+  X_train, y_train,
+  group = group,
+  penalty = "grSCAD",   
+  family = "binomial",
+  seed = 123
+)
+
+lambda_min_scad <- cvfit_scad$lambda.min
+
+# Extract coefficients at optimal λ
+coef_min_scad <- coef(cvfit_scad, lambda = lambda_min_scad)
+coef_min_scad
+```
+
+
+
+
+## 1D Model Fitting
+
+### 1D.1 Bootstrapped Benchmark Model
+
+```{r boot standard lr}
+B <- 500
+coef_mat <- matrix(NA, nrow = B, 
+                   ncol = length(coef(
+                     glm(Landslide ~ Elev + Slope + PGAComp + VerticalCurvature +
+                           HorizontalCurvature + Aspect + Lithology + SoilType, 
+                         data = train_data, family="binomial"))))
+
+colnames(coef_mat) <- names(coef(
+  glm(Landslide ~ Elev + Slope + PGAComp + VerticalCurvature + 
+        HorizontalCurvature + Aspect + Lithology + SoilType, 
+      data = train_data, family="binomial")))
+
+set.seed(123)
+for (b in 1:B) {
+  idx <- sample(seq_len(nrow(train_data)), replace = TRUE)
+  d_b <- train_data[idx, ]
+  fit_b <- glm(Landslide ~ Elev + Slope + PGAComp + VerticalCurvature + 
+                 HorizontalCurvature + Aspect + Lithology + SoilType, 
+               data = d_b, family = "binomial")
+  coef_b <- coef(fit_b)
+  coef_mat[b, names(coef_b)] <- coef_b
+}
+```
+
+### 1D.2 Bootstrapped Proposed Model: grLASSO 
+
+```{r boot grLASSO lr, eval=FALSE, include=FALSE}
+B <- 500   
+
+coef_storage    <- matrix(NA, nrow = ncol(X_train), ncol = B)
+colnames(coef_storage) <- paste0("Rep", 1:B)
+rownames(coef_storage) <- colnames(X_train)
+
+prediction_list <- vector("list", B)
+actual_list     <- vector("list", B)
+perf_metrics    <- data.frame(
+  Rep = 1:B,
+  AUC = NA,
+  Accuracy = NA,
+  LogLoss = NA,
+  Brier = NA
+)
+
+set.seed(123)
+for (b in 1:B) {
+  idx <- sample(seq_len(nrow(X_train)), replace = TRUE)
+  Xb <- X_train[idx, ]
+  yb <- y_train[idx]
+  
+  cvfit_b <- cv.grpreg(
+    Xb, yb,
+    group = group,
+    penalty = "grLasso",
+    family = "binomial",
+    measure = "deviance",
+    seed = b
+  )
+  
+  lambda_min_b <- cvfit_b$lambda.min
+  
+  coef_b <- coef(cvfit_b, lambda = lambda_min_b)[-1]  
+  coef_storage[, b] <- coef_b
+  
+  prob_b <- predict(cvfit_b, Xb, type = "response", lambda = lambda_min_b)
+  prediction_list[[b]] <- prob_b
+  actual_list[[b]]     <- yb
+  
+  auc_b <- pROC::auc(pROC::roc(yb, prob_b))
+  acc_b <- mean((prob_b > 0.5) == yb)
+  logloss_b <- -mean(yb*log(prob_b) + (1-yb)*log(1-prob_b))
+  brier_b <- mean((prob_b - yb)^2)
+  
+  perf_metrics[b, c("AUC","Accuracy","LogLoss","Brier")] <- c(auc_b, acc_b, logloss_b, brier_b)
+}
+
+# Save everything together
+saveRDS(list(
+  coefficients = coef_storage,
+  performance  = perf_metrics, 
+  actuals      = actual_list
+), file = "GroupLASSO-boot-results-strat1.rds")
+```
+
+```{r boot grLASSO lr LOAD}
+
+```
+
+
+### 1D.3 Bootstrapped Proposed Model: grSCAD (copied chunk from 24AprGroupedLASSO-SCAD.qmd)
+
+```{r boot grSCAD lr, eval=FALSE}
+B <- 500
+
+coef_storage    <- matrix(NA, nrow = ncol(X_train), ncol = B)
+colnames(coef_storage) <- paste0("Rep", 1:B)
+rownames(coef_storage) <- colnames(X_train)
+
+prediction_list <- vector("list", B)
+actual_list     <- vector("list", B)
+perf_metrics    <- data.frame(
+  Rep = 1:B,
+  AUC = NA,
+  Accuracy = NA,
+  LogLoss = NA,
+  Brier = NA
+)
+
+set.seed(123)
+for (b in 1:B) {
+  idx <- sample(seq_len(nrow(X_train)), replace = TRUE)
+  Xb <- X_train[idx, ]
+  yb <- y_train[idx]
+  
+  cvfit_b <- cv.grpreg(
+    Xb, yb,
+    group   = group,
+    penalty = "grSCAD",   
+    family  = "binomial",
+    measure = "deviance",
+    seed    = b
+  )
+  
+  lambda_min_b <- cvfit_b$lambda.min
+  
+  coef_b <- coef(cvfit_b, lambda = lambda_min_b)[-1]
+  coef_storage[, b] <- coef_b
+  
+  prob_b <- predict(cvfit_b, Xb, type = "response", lambda = lambda_min_b)
+  prediction_list[[b]] <- prob_b
+  actual_list[[b]]     <- yb
+  
+  auc_b <- pROC::auc(pROC::roc(yb, prob_b))
+  acc_b <- mean((prob_b > 0.5) == yb)
+  logloss_b <- -mean(yb*log(prob_b) + (1-yb)*log(1-prob_b))
+  brier_b   <- mean((prob_b - yb)^2)
+  
+  perf_metrics[b, c("AUC","Accuracy","LogLoss","Brier")] <- c(auc_b, acc_b, logloss_b, brier_b)
+}
+
+saveRDS(list(
+  coefficients = coef_storage,
+  performance  = perf_metrics,
+  predictions  = prediction_list,
+  actuals      = actual_list
+), file = "GroupSCAD-boot-results-strat1.rds")
+```
+
+```{r boot grSCAD lr LOAD}
+
+```
+
+## 1E Model Diagnostic (incl. Significant Testing)
+
+### 1E.1 Benchmark Model
+
+```{r Multicollinearity}
+lm_model <- glm(Landslide ~ Elev + Slope + HorizontalCurvature + VerticalCurvature + 
+                     PGAComp + Aspect + Lithology + SoilType, 
+                   data = data, family = "binomial"(link = "logit"))
+
+
+vif(lm_model)
+```
+
+```{r boot lr SIGNIFICANT}
+ci_lower <- apply(coef_mat, 2, function(x) quantile(x, 0.025, na.rm = TRUE))
+ci_upper <- apply(coef_mat, 2, function(x) quantile(x, 0.975, na.rm = TRUE))
+
+coef_median <- apply(coef_mat, 2, function(x) median(x, na.rm = TRUE))
+coef_mean   <- apply(coef_mat, 2, function(x) mean(x, na.rm = TRUE))
+
+prop_exclude_zero <- apply(coef_mat, 2, function(x) {
+  mean(sign(x) == sign(mean(x, na.rm = TRUE)), na.rm = TRUE)
+})
+
+coef_summary <- data.frame(
+  term    = colnames(coef_mat),
+  mean    = coef_mean,
+  median  = coef_median,
+  ci_lower = ci_lower,
+  ci_upper = ci_upper,
+  stringsAsFactors = FALSE
+)
+
+coef_summary$mean <- ifelse(prop_exclude_zero >= 0.95,
+                           paste0(round(coef_summary$mean, 6), "*"),
+                           round(coef_summary$mean, 6))
+
+coef_summary$mean <- ifelse(coef_summary$ci_lower > 0 | coef_summary$ci_upper < 0,
+                            paste0(round(coef_summary$mean, 6), "*"),
+                            round(coef_summary$mean, 6))
+
+
+coef_summary <- coef_summary[order(-abs(coef_summary$median)), ]
+coef_summary
+
+saveRDS(coef_summary, file = "Boot-Standard-LR-coef-summary-strat1.rds")
+```
+
+### 1E.2 Proposed Model: grLASSO
+
+```{r boot grLASSO, eval=FALSE, include=FALSE}
+B <- 500   
+
+coef_storage    <- matrix(NA, nrow = ncol(X_train), ncol = B)
+colnames(coef_storage) <- paste0("Rep", 1:B)
+rownames(coef_storage) <- colnames(X_train)
+
+prediction_list <- vector("list", B)
+actual_list     <- vector("list", B)
+perf_metrics    <- data.frame(
+  Rep = 1:B,
+  AUC = NA,
+  Accuracy = NA,
+  LogLoss = NA,
+  Brier = NA
+)
+
+set.seed(123)
+for (b in 1:B) {
+  idx <- sample(seq_len(nrow(X_train)), replace = TRUE)
+  Xb <- X_train[idx, ]
+  yb <- y_train[idx]
+  
+  cvfit_b <- cv.grpreg(
+    Xb, yb,
+    group = group,
+    penalty = "grLasso",
+    family = "binomial",
+    measure = "deviance",
+    seed = b
+  )
+  
+  lambda_min_b <- cvfit_b$lambda.min
+  
+  coef_b <- coef(cvfit_b, lambda = lambda_min_b)[-1] 
+  coef_storage[, b] <- coef_b
+  
+  prob_b <- predict(cvfit_b, Xb, type = "response", lambda = lambda_min_b)
+  prediction_list[[b]] <- prob_b
+  actual_list[[b]]     <- yb
+  
+  auc_b <- pROC::auc(pROC::roc(yb, prob_b))
+  acc_b <- mean((prob_b > 0.5) == yb)
+  logloss_b <- -mean(yb*log(prob_b) + (1-yb)*log(1-prob_b))
+  brier_b <- mean((prob_b - yb)^2)
+  
+  perf_metrics[b, c("AUC","Accuracy","LogLoss","Brier")] <- c(auc_b, acc_b, logloss_b, brier_b)
+}
+
+saveRDS(list(
+  coefficients = coef_storage,
+  performance  = perf_metrics, 
+  actuals      = actual_list,
+  prediction = prediction_list,
+), file = "boot-grLASSO-results-strat1.rds")
+```
+
+```{r boot grLASSO READ}
+results <- readRDS("boot-grLASSO-results-strat1.rds")
+
+coef_mat <- results$coefficients
+
+coef_mean   <- rowMeans(coef_mat, na.rm = TRUE)
+coef_median <- apply(coef_mat, 1, function(x) median(x[x != 0], na.rm = TRUE))
+ci_lower    <- apply(coef_mat, 1, function(x) if (any(x != 0)) quantile(x[x != 0], 0.025) else 0)
+ci_upper    <- apply(coef_mat, 1, function(x) if (any(x != 0)) quantile(x[x != 0], 0.975) else 0)
+inclusion_freq <- rowMeans(coef_mat != 0) * 100
+
+coef_summary_lasso <- data.frame(
+  term = rownames(coef_mat),
+  mean = coef_mean,
+  median = coef_median,
+  ci_lower = ci_lower,
+  ci_upper = ci_upper,
+  inclusion_freq = inclusion_freq,
+  stringsAsFactors = FALSE
+)
+
+sig_flag <- with(coef_summary_lasso, (ci_lower > 0 | ci_upper < 0))
+
+coef_summary_lasso$mean <- ifelse(sig_flag,
+                                    paste0(round(coef_summary_lasso$mean, 3), "*"),
+                                    as.character(round(coef_summary_lasso$mean, 3)))
+
+coef_summary_lasso <- coef_summary_lasso[order(-abs(coef_summary_lasso$median)), ]
+
+coef_summary_lasso
+```
+
+
+### 2E.3 Proposed Model: grSCAD
+
+```{r grSCAD}
+B <- 500  
+
+coef_storage    <- matrix(NA, nrow = ncol(X_train), ncol = B)
+colnames(coef_storage) <- paste0("Rep", 1:B)
+rownames(coef_storage) <- colnames(X_train)
+
+prediction_list <- vector("list", B)
+actual_list     <- vector("list", B)
+perf_metrics    <- data.frame(
+  Rep = 1:B,
+  AUC = NA,
+  Accuracy = NA,
+  LogLoss = NA,
+  Brier = NA
+)
+
+
+set.seed(123)
+for (b in 1:B) {
+  idx <- sample(seq_len(nrow(X_train)), replace = TRUE)
+  Xb <- X_train[idx, ]
+  yb <- y_train[idx]
+  
+  cvfit_b <- cv.grpreg(
+    Xb, yb,
+    group   = group,
+    penalty = "grSCAD",   
+    family  = "binomial",
+    measure = "deviance",
+    seed    = b
+  )
+  
+  lambda_min_b <- cvfit_b$lambda.min
+  
+  coef_b <- coef(cvfit_b, lambda = lambda_min_b)[-1]
+  coef_storage[, b] <- coef_b
+  
+  prob_b <- predict(cvfit_b, Xb, type = "response", lambda = lambda_min_b)
+  prediction_list[[b]] <- prob_b
+  actual_list[[b]]     <- yb
+  
+  auc_b <- pROC::auc(pROC::roc(yb, prob_b))
+  acc_b <- mean((prob_b > 0.5) == yb)
+  logloss_b <- -mean(yb*log(prob_b) + (1-yb)*log(1-prob_b))
+  brier_b   <- mean((prob_b - yb)^2)
+  
+  perf_metrics[b, c("AUC","Accuracy","LogLoss","Brier")] <- c(auc_b, acc_b, logloss_b, brier_b)
+}
+
+saveRDS(list(
+  coefficients = coef_storage,
+  performance  = perf_metrics,
+  predictions  = prediction_list,
+  actuals      = actual_list
+), file = "boot-grSCAD-results-strat1.rds")
+```
+
+
+```{r boot grSCAD READ}
+results <- readRDS("boot-grSCAD-results-strat1.rds")
+
+coef_storage    <- results$coefficients
+prediction_list <- results$predictions
+actual_list     <- results$actuals
+
+inclusion_freq <- rowMeans(coef_storage != 0) * 100
+sort(inclusion_freq, decreasing = TRUE)
+
+coef_mean_scad   <- rowMeans(coef_storage, na.rm = TRUE)
+coef_median_scad <- apply(coef_storage, 1, function(x) median(x[x != 0], na.rm = TRUE))
+ci_lower_scad    <- apply(coef_storage, 1, function(x) quantile(x[x != 0], 0.025, na.rm = TRUE))
+ci_upper_scad    <- apply(coef_storage, 1, function(x) quantile(x[x != 0], 0.975, na.rm = TRUE))
+
+coef_summary_scad <- data.frame(
+  term          = rownames(coef_storage),
+  mean          = coef_mean_scad,
+  median        = coef_median_scad,
+  ci_lower      = ci_lower_scad,
+  ci_upper      = ci_upper_scad,
+  inclusion_freq= inclusion_freq,
+  significant   = sig_flag,
+  stringsAsFactors = FALSE
+)
+
+sig_flag_scad <- with(coef_summary_scad, (ci_lower > 0 | ci_upper < 0))
+
+coef_summary_scad$mean <- ifelse(sig_flag_scad,
+                                         paste0(round(coef_summary_scad$mean, 3), "*"),
+                                         as.character(round(coef_summary_scad$mean, 3)))
+
+coef_summary_scad <- coef_summary_scad[order(-abs(coef_summary_scad$median)), ]
+
+coef_summary_scad
+```
+
+## 1F Variable Importance
+
+### 1F.1 Benchmark Model
+
+```{r reduced LR model}
+benchmark_model_reduced <- glm(Landslide ~  Lithology + SoilType + Slope + PGAComp + Elev, 
+                     data = train_data, family = "binomial")
+```
+
+```{r LRT on lr}
+drop_res <- drop1(benchmark_model_reduced, test="Chisq")
+
+dev_increase <- drop_res$Deviance
+names(dev_increase) <- rownames(drop_res)
+
+ranked <- sort(dev_increase, decreasing=TRUE)
+
+total_dev <- sum(ranked, na.rm = TRUE)
+percent_importance <- (ranked / total_dev) * 100
+
+rank_table <- data.frame(
+  Variable = names(ranked),
+  DevianceIncrease = ranked,
+  PercentImportance = round(percent_importance, 2),
+  Rank = seq_along(ranked)
+)
+print(rank_table)
+
+drop_res |> print()
+```
+
+### 1F.2 Proposed Model: grLASSO
+
+```{r}
+coef_summary_lasso$inclusion_freq
+```
+
+### 1F.3 Proposed Model: grSCAD
+
+```{r}
+coef_summary_scad$inclusion_freq
+```
+
+
+
+
+## 1G Model Evaluation
+
+### 1G.1 Benchmark Model
+
+```{r boot lr threshold CODE, eval=FALSE, include=FALSE}
+thresholds <- data.frame(Rep = 1:B, F1 = NA_real_)
+
+safe_f1 <- function(preds, y) {
+  cm <- table(factor(preds, levels = c(0,1)),
+              factor(y, levels = c(0,1)))
+  TP <- cm["1","1"]; FP <- cm["1","0"]; FN <- cm["0","1"]
+  prec <- ifelse(TP + FP == 0, 0, TP / (TP + FP))
+  rec  <- ifelse(TP + FN == 0, 0, TP / (TP + FN))
+  if (prec + rec == 0) return(0)
+  2 * prec * rec / (prec + rec)
+}
+
+for (b in 1:B) {
+  coef_b <- coef_mat[b, ]
+  names(coef_b) <- colnames(coef_mat)
+
+  intercept <- if ("(Intercept)" %in% names(coef_b)) coef_b["(Intercept)"] else 0
+  betas     <- coef_b[names(coef_b) != "(Intercept)"]
+
+  common_vars <- intersect(names(betas), colnames(X_test))
+  betas <- betas[common_vars]
+  X_test_num <- as.matrix(X_test[, common_vars, drop = FALSE])
+
+  lp <- drop(X_test_num %*% betas + intercept)
+  probs <- 1 / (1 + exp(-lp))
+
+  thresh_seq <- seq(0.01, 0.99, by = 0.01)
+  f1_scores <- sapply(thresh_seq, function(t) {
+    preds_t <- ifelse(probs > t, 1, 0)
+    safe_f1(preds_t, y_test)
+  })
+
+  thresholds$F1[b] <- thresh_seq[which.max(f1_scores)]
+}
+
+saveRDS(thresholds, "boot-lr-threshold-strat1.rds")
+```
+
+```{r boot lr threshold READ}
+thresholds <- readRDS("boot-lr-threshold-strat1.rds")
+
+summary(thresholds$F1)
+median_thresh_lr <- median(thresholds$F1, na.rm = TRUE)
+```
+
+```{r LR evaluation metrics}
+evaluate_model <- function(model, data, threshold = median_thresh_lr) {
+  probs <- predict(model, newdata = test_data, type = "response")
+  preds <- ifelse(probs > threshold, 1, 0)
+  
+  cm <- table(Predicted = preds, Actual = data$Landslide)
+  
+  TP <- cm[2,2]; TN <- cm[1,1]
+  FP <- cm[2,1]; FN <- cm[1,2]
+  
+  accuracy <- (TP + TN) / sum(cm)
+  sensitivity <- TP / (TP + FN)
+  specificity <- TN / (TN + FP)
+  precision <- TP / (TP + FP)
+  f1 <- 2 * precision * sensitivity / (precision + sensitivity)
+  
+  brier <- mean((probs - data$Landslide)^2)
+  logloss <- -mean(data$Landslide * log(probs) + 
+                   (1 - data$Landslide) * log(1 - probs))
+  
+  # Build ROC object
+  roc_obj <- pROC::roc(data$Landslide, probs)
+  auc_val <- pROC::auc(roc_obj)  
+  
+  pr_obj <- PRROC::pr.curve(
+  scores.class0 = probs[data$Landslide == 1],
+  scores.class1 = probs[data$Landslide == 0],
+  curve = FALSE
+  )
+  pr_auc <- pr_obj$auc.integral
+
+  
+  best_thresh <- coords(roc_obj, "best", best.method = "youden", ret = "threshold")
+  f1_thresh <- coords(roc_obj, "best", best.method = "closest.topleft", ret = "threshold")
+
+  
+  return(list(Accuracy = accuracy,
+              Sensitivity = sensitivity,
+              Specificity = specificity,
+              Precision = precision,
+              F1 = f1,
+              PRAUC = pr_auc,
+              AUC = auc_val,
+              Brier = brier,
+              LogLoss = logloss
+              ))
+}
+
+metricsLR <- evaluate_model(benchmark_model_reduced, test_data)
+metricsLR
+```
+
+
+### 1G.2 Proposed Model: grLASSO
+
+```{r reduced grLASSO model}
+X_train_grLASSO_reduced <- model.matrix(Landslide ~ Elev + Slope + PGAComp +  Lithology + 
+                                          Aspect + SoilType,
+                     data = train_data)[, -1]  
+X_test_grLASSO_reduced <- model.matrix(Landslide ~ Elev + Slope + PGAComp +  Lithology + 
+                                          Aspect + SoilType,
+                                       data = test_data)[, -1]
+
+cols <- colnames(X_train_grLASSO_reduced)
+
+group_grLASSO_reduced <- integer(length(cols))
+
+group_grLASSO_reduced[grep("^Slope$", cols)]    <- 1
+group_grLASSO_reduced[grep("^PGAComp$", cols)]  <- 2
+group_grLASSO_reduced[grep("^Elev", cols)] <- 3
+group_grLASSO_reduced[grep("^Lithology", cols)] <- 4
+group_grLASSO_reduced[grep("^Aspect", cols)] <- 5
+group_grLASSO_reduced[grep("^SoilType", cols)] <- 6
+
+table(group_grLASSO_reduced)
+cbind(cols, group_grLASSO_reduced)
+
+
+fit_grLASSO_reduced <- grpreg(
+  X_train_grLASSO_reduced, y_train,
+  group = group_grLASSO_reduced,
+  penalty = "grLasso",
+  family = "binomial"
+)
+
+set.seed(123)
+cvfit_grLASSO_reduced <- cv.grpreg(
+  X_train_grLASSO_reduced, y_train,
+  group = group_grLASSO_reduced,
+  penalty = "grLasso",  
+  family = "binomial",
+  seed = 123
+)
+
+lambda_min_grLASSO_reduced <- cvfit_grLASSO_reduced$lambda.min
+cvfit_grLASSO_reduced |> plot()
+lambda_min_grLASSO_reduced
+
+
+coef_min_grLASSO_reduced <- coef(cvfit_grLASSO_reduced, lambda = lambda_min_grLASSO_reduced)
+coef_min_grLASSO_reduced    
+```
+
+```{r  boot grLASSO threshold CODE}
+results <- readRDS("GroupLASSO-boot-results-strat1.rds")
+
+coef_storage    <- results$coefficients  
+actual_list     <- results$actuals       
+
+inclusion_freq <- rowMeans(coef_storage != 0) * 100
+
+selected_levels <- rownames(coef_storage)[inclusion_freq >= 80]
+
+X_train_reduced <- as.matrix(X_train[, intersect(colnames(X_train), selected_levels), drop = FALSE])
+
+cv_lasso_reduced <- cv.glmnet(
+  X_train_reduced, y_train,
+  family = "binomial", alpha = 1,
+  standardize = FALSE
+)
+
+X_test <- as.data.frame(X_test)
+missing_cols <- setdiff(colnames(X_train_reduced), colnames(X_test))
+for (mc in missing_cols) {
+  X_test[[mc]] <- 0
+}
+X_test_reduced <- as.matrix(X_test[, colnames(X_train_reduced), drop = FALSE])
+
+stopifnot(nrow(X_test_reduced) == length(y_test))
+
+
+thresholds <- data.frame(Rep = 1:ncol(coef_storage), F1 = NA_real_)
+
+safe_f1 <- function(preds, y) {
+  cm <- table(
+    Predicted = factor(preds, levels = c(0,1)),
+    Actual    = factor(y, levels = c(0,1))
+  )
+  TP <- cm["1","1"]; FP <- cm["1","0"]; FN <- cm["0","1"]
+  prec <- ifelse(TP + FP == 0, 0, TP / (TP + FP))
+  rec  <- ifelse(TP + FN == 0, 0, TP / (TP + FN))
+  if (prec + rec == 0) return(0)
+  2 * prec * rec / (prec + rec)
+}
+
+for (b in 1:ncol(coef_storage)) {
+  coef_b <- coef_storage[, b]
+
+  intercept <- if ("(Intercept)" %in% rownames(coef_storage)) coef_b["(Intercept)"] else 0
+  betas <- coef_b[rownames(coef_storage) != "(Intercept)"]
+
+  common_vars <- intersect(names(betas), colnames(X_test))
+  betas <- betas[common_vars]
+  X_test_num <- as.matrix(X_test[, common_vars, drop = FALSE])
+
+  lp <- drop(X_test_num %*% betas + intercept)
+  probs <- 1 / (1 + exp(-lp))
+
+  y <- y_test   # fixed test labels
+
+  thresh_seq <- seq(0.01, 0.99, by = 0.01)
+  f1_scores <- sapply(thresh_seq, function(t) {
+    preds_t <- ifelse(probs > t, 1, 0)
+    safe_f1(preds_t, y)
+  })
+
+  thresholds$F1[b] <- if (all(is.na(f1_scores))) NA else thresh_seq[which.max(f1_scores)]
+}
+
+summary(na.omit(thresholds$F1))
+
+saveRDS(thresholds, file = "boot-grLASSO-threshold-strat1.rds")
+```
+
+```{r boot grLASSO threshold READ}
+thresholds <- readRDS("boot-grLASSO-threshold-strat1.rds")
+
+summary(thresholds$F1)
+median(thresholds$F1, na.rm = TRUE)
+mean(thresholds$F1, na.rm = TRUE)
+sd(thresholds$F1, na.rm = TRUE)
+
+median_thresh_grLASSO <- median(thresholds$F1, na.rm = TRUE)
+```
+
+```{r grLASSO evaluation metrics}
+X_test <- as.matrix(X_test)
+
+evaluate_model <- function(model, X, y, f1_thresh = 0.99) {
+  
+  X <- as.matrix(X)
+  
+  probs <- predict(model, X,
+                   type   = "response",
+                   lambda = model$lambda.min)
+  probs <- as.numeric(probs)
+  
+  preds <- ifelse(probs > f1_thresh, 1, 0)
+  cm <- table(Predicted = preds, Actual = y)
+  
+  TP <- cm["1","1"]; TN <- cm["0","0"]
+  FP <- cm["1","0"]; FN <- cm["0","1"]
+  
+  accuracy    <- (TP + TN) / sum(cm)
+  sensitivity <- TP / (TP + FN)
+  specificity <- TN / (TN + FP)
+  precision   <- TP / (TP + FP)
+  f1          <- 2 * precision * sensitivity / (precision + sensitivity)
+  
+  brier   <- mean((probs - y)^2)
+  logloss <- -mean(y * log(probs) + (1 - y) * log(1 - probs))
+  
+  roc_obj <- pROC::roc(y, probs)
+  auc_val <- pROC::auc(roc_obj)
+  
+  pr_obj <- PRROC::pr.curve(
+  scores.class0 = probs[y == 1],
+  scores.class1 = probs[y == 0],
+  curve = FALSE
+  )
+  pr_auc <- pr_obj$auc.integral
+
+  return(list(Accuracy = accuracy,
+              Sensitivity = sensitivity,
+              Specificity = specificity,
+              Precision = precision,
+              F1 = f1,
+              PRAUC = pr_auc,
+              AUC         = auc_val,
+              Brier       = brier,
+              LogLoss     = logloss,
+              F1Thresh    = f1_thresh
+            ))
+}
+
+
+metricsgroupLASSO <- evaluate_model(cvfit_grLASSO_reduced, X_test_grLASSO_reduced, y_test, f1_thresh = median_thresh_grLASSO)
+metricsgroupLASSO
+```
+
+
+### 1G.3 Proposed Model: grSCAD
+
+```{r reduced grSCAD model}
+X_train_grSCAD_reduced <- model.matrix(Landslide ~ Slope + PGAComp +  Lithology + SoilType,
+                     data = train_data)[, -1]  
+X_test_grSCAD_reduced <- model.matrix(Landslide ~ Slope + PGAComp + Lithology + SoilType,
+                                       data = test_data)[, -1]
+
+cols <- colnames(X_train_grSCAD_reduced)
+
+group_grSCAD_reduced <- integer(length(cols))
+
+group_grSCAD_reduced[grep("^Slope$", cols)]    <- 1
+group_grSCAD_reduced[grep("^PGAComp$", cols)]  <- 2
+group_grSCAD_reduced[grep("^Lithology", cols)] <- 3
+group_grSCAD_reduced[grep("^SoilType", cols)]  <- 4
+
+table(group_grSCAD_reduced)
+cbind(cols, group_grSCAD_reduced) 
+
+fit_grSCAD_reduced <- grpreg(
+  X_train_grSCAD_reduced, y_train,
+  group = group_grSCAD_reduced,
+  penalty = "grLasso",
+  family = "binomial"
+)
+
+set.seed(123)
+cvfit_grSCAD_reduced <- cv.grpreg(
+  X_train_grSCAD_reduced, y_train,
+  group = group_grSCAD_reduced,
+  penalty = "grLasso",  
+  family = "binomial",
+  seed = 123
+)
+
+lambda_min_grSCAD_reduced <- cvfit_grSCAD_reduced$lambda.min
+cvfit_grSCAD_reduced |> plot()
+lambda_min_grSCAD_reduced
+
+
+coef_min_grSCAD_reduced <- coef(cvfit_grSCAD_reduced, lambda = lambda_min_grSCAD_reduced)
+coef_min_grSCAD_reduced    
+```
+
+```{r boot grLASSO threshold CODE}
+results <- readRDS("boot-grSCAD-results-strat1.rds")
+coef_storage    <- results$coefficients
+prediction_list <- results$predictions
+actual_list     <- results$actuals
+
+inclusion_freq <- rowMeans(coef_storage != 0) * 100
+
+selected_levels <- names(inclusion_freq[inclusion_freq >= 80])
+
+X_train_reduced <- as.matrix(X_train[, intersect(colnames(X_train), selected_levels), drop = FALSE])
+
+cv_scad_reduced <- cv.glmnet(
+  X_train_reduced, y_train,
+  family = "binomial", alpha = 1,
+  standardize = FALSE
+)
+
+X_test <- as.data.frame(X_test)  # ensure data frame
+missing_cols <- setdiff(colnames(X_train_reduced), colnames(X_test))
+for (mc in missing_cols) {
+  X_test[[mc]] <- 0
+}
+X_test_reduced <- as.matrix(X_test[, colnames(X_train_reduced), drop = FALSE])
+
+stopifnot(nrow(X_test_reduced) == length(y_test))
+
+
+
+thresholds <- data.frame(Rep = 1:length(prediction_list),
+                         F1 = NA_real_)
+
+for (i in seq_along(prediction_list)) {
+  probs <- as.numeric(prediction_list[[i]])
+  y     <- actual_list[[i]]
+
+  thresh_seq <- seq(0.01, 0.99, by = 0.01)
+  f1_scores <- sapply(thresh_seq, function(t) {
+    preds_t <- ifelse(probs > t, 1, 0)
+
+    cm_t <- table(
+      Predicted = factor(preds_t, levels = c(0,1)),
+      Actual    = factor(y, levels = c(0,1))
+    )
+
+    TP_t <- cm_t["1","1"]; FN_t <- cm_t["0","1"]; FP_t <- cm_t["1","0"]
+    prec_t <- ifelse(TP_t + FP_t == 0, 0, TP_t / (TP_t + FP_t))
+    rec_t  <- ifelse(TP_t + FN_t == 0, 0, TP_t / (TP_t + FN_t))
+    if (prec_t + rec_t == 0) return(0)
+    2 * prec_t * rec_t / (prec_t + rec_t)
+  })
+
+  thresholds$F1[i] <- thresh_seq[which.max(f1_scores)]
+}
+
+
+saveRDS(thresholds, file = "boot-grSCAD-threshold-strat1.rds")
+```
+
+
+```{r boot grLASSO threshold READ}
+thresholds <- readRDS("boot-grSCAD-threshold-strat1.rds")
+
+summary(thresholds$F1)
+median(thresholds$F1, na.rm = TRUE)
+mean(thresholds$F1, na.rm = TRUE)
+sd(thresholds$F1, na.rm = TRUE)
+
+median_thresh_grSCAD <- median(thresholds$F1, na.rm = TRUE)
+```
+
+
+```{r grSCAD evaluation metrics}
+X_test <- as.matrix(X_test)
+
+evaluate_model <- function(model, X, y, f1_thresh = 0.51) {
+  X <- as.matrix(X)
+  
+  probs <- predict(model, X,
+                   type   = "response",
+                   lambda = model$lambda.min)
+  probs <- as.numeric(probs)
+  
+  preds <- ifelse(probs > f1_thresh, 1, 0)
+  cm <- table(Predicted = preds, Actual = y)
+  
+  TP <- cm["1","1"]; TN <- cm["0","0"]
+  FP <- cm["1","0"]; FN <- cm["0","1"]
+  
+  accuracy    <- (TP + TN) / sum(cm)
+  sensitivity <- TP / (TP + FN)
+  specificity <- TN / (TN + FP)
+  precision   <- TP / (TP + FP)
+  f1          <- 2 * precision * sensitivity / (precision + sensitivity)
+  
+  brier   <- mean((probs - y)^2)
+  logloss <- -mean(y * log(probs) + (1 - y) * log(1 - probs))
+  
+  roc_obj <- pROC::roc(y, probs)
+  auc_val <- pROC::auc(roc_obj)
+  
+  pr_obj <- PRROC::pr.curve(
+  scores.class0 = probs[y == 1],
+  scores.class1 = probs[y == 0],
+  curve = FALSE
+  )
+  pr_auc <- pr_obj$auc.integral
+
+  return(list(Accuracy = accuracy,
+              Sensitivity = sensitivity,
+              Specificity = specificity,
+              Precision = precision,
+              F1 = f1,
+              PRAUC = pr_auc,
+              AUC         = auc_val,
+              Brier       = brier,
+              LogLoss     = logloss,
+              F1Thresh    = f1_thresh
+            ))
+}
+
+
+metricsgroupSCAD <- evaluate_model(cvfit_grSCAD_reduced, X_test_grSCAD_reduced, y_test, f1_thresh = median_thresh_grSCAD)
+metricsgroupSCAD
+```
+
+## 1H Cross Validation
+
+### 1H.1 Reduced LR Model's Cross-Validated Performance
+
+```{r reduced lr CV}
+set.seed(123)
+
+cv_folds <- createFolds(data$Landslide, k = 10, list = TRUE, returnTrain = FALSE)
+
+cv_results <- data.frame(
+  Accuracy = numeric(10),
+  Sensitivity = numeric(10),
+  Specificity = numeric(10),
+  Precision = numeric(10),
+  F1 = numeric(10),
+  AUC = numeric(10),
+  PR_AUC = numeric(10),
+  Brier = numeric(10),
+  LogLoss = numeric(10)
+)
+
+coef_list <- vector("list", 10)
+
+
+for (i in 1:10) {
+  test_idx <- cv_folds[[i]]
+  test_fold <- data[test_idx, ]
+  train_fold <- data[-test_idx, ]
+  
+  # --- Set reference levels for categorical predictors (must exist in levels) ---
+  train_fold$SoilType   <- relevel((train_fold$SoilType), ref = "Loam")
+  train_fold$Lithology  <- relevel((train_fold$Lithology), ref = "Recent deposits")
+  train_fold$Aspect     <- relevel((train_fold$Aspect), ref = "North")
+  
+  test_fold$SoilType    <- relevel((test_fold$SoilType), ref = "Loam")
+  test_fold$Lithology   <- relevel((test_fold$Lithology), ref = "Recent deposits")
+  test_fold$Aspect      <- relevel((test_fold$Aspect), ref = "North")
+  
+  # Fit LR on training folds
+  fit <- glm(Landslide ~ SoilType + Slope + Lithology + PGAComp + Elev,
+             data = train_fold, family = "binomial")
+  
+  # Save coefficients for this fold
+  coef_list[[i]] <- coef(fit)
+  
+  # Predict on held-out fold
+  preds <- predict(fit, newdata = test_fold, type = "response")
+  pred_class <- ifelse(preds > 0.56, 1, 0)
+  
+  # Confusion matrix
+  cm <- table(Predicted = pred_class, Actual = test_fold$Landslide)
+  
+  TP <- cm["1","1"]; TN <- cm["0","0"]
+  FP <- cm["1","0"]; FN <- cm["0","1"]
+  
+  acc <- (TP + TN) / sum(cm)
+  sens <- TP / (TP + FN)
+  spec <- TN / (TN + FP)
+  prec <- TP / (TP + FP)
+  f1 <- 2 * prec * sens / (prec + sens)
+  
+  # ROC & AUC
+  roc_obj <- roc(test_fold$Landslide, preds)
+  auc_val <- auc(roc_obj)
+  
+  pr_obj <- PRROC::pr.curve(
+  scores.class0 = preds[test_fold$Landslide == 1],
+  scores.class1 = preds[test_fold$Landslide == 0],
+  curve = FALSE
+  )
+  pr_auc <- pr_obj$auc.integral
+  
+  
+  # Brier score
+  brier <- mean((preds - test_fold$Landslide)^2)
+  
+  # LogLoss
+  eps <- 1e-15
+  logloss <- -mean(test_fold$Landslide * log(pmax(preds, eps)) +
+                   (1 - test_fold$Landslide) * log(pmax(1 - preds, eps)))
+  
+  # Store metrics
+  #cv_results[i,] <- c(acc, sens, spec, prec, f1, auc_val, brier, logloss)
+  cv_results[i,] <- c(acc, sens, spec, prec, f1, auc_val, pr_auc, brier, logloss)
+}
+
+# Average metrics across folds
+cv_summary_lr <- colMeans(cv_results, na.rm = TRUE)
+
+# Combine coefficients across folds
+coef_mat <- do.call(cbind, coef_list)
+
+coef_summary_cv_lr <- data.frame(
+  Term   = rownames(coef_mat),
+  Mean   = rowMeans(coef_mat, na.rm = TRUE),
+  Median = apply(coef_mat, 1, median, na.rm = TRUE),
+  SD     = apply(coef_mat, 1, sd, na.rm = TRUE)
+)
+
+cv_summary_lr
+coef_summary_cv_lr
+```
+
+
+### 1H.2 Reduced grLASSO Model's Cross-Validated Performance
+
+```{r reduced grLASSO CV}
+set.seed(123)
+
+data$SoilType   <- relevel(factor(data$SoilType), ref = "Loam")
+data$Lithology  <- relevel(factor(data$Lithology), ref = "Recent deposits")
+data$Aspect     <- relevel(factor(data$Aspect), ref = "North")
+
+X <- model.matrix(~ Elev + Slope + PGAComp + Aspect + Lithology + SoilType, 
+                  data = data)[, -1]
+y <- data$Landslide
+
+cols <- colnames(X)
+group <- integer(length(cols))
+
+group[grep("^Elev$", cols)]                <- 1
+group[grep("^Slope$", cols)]               <- 2
+group[grep("^PGAComp$", cols)]             <- 3
+group[grep("^Aspect", cols)]     <- 4
+group[grep("^Lithology", cols)]  <- 5
+group[grep("^SoilType", cols)]   <- 6
+
+print(table(group))
+print(cbind(cols, group))
+
+
+# 10-fold CV
+cv_folds <- createFolds(y, k = 10, list = TRUE)
+
+cv_results <- data.frame(
+  Accuracy = numeric(10),
+  Sensitivity = numeric(10),
+  Specificity = numeric(10),
+  Precision = numeric(10),
+  F1 = numeric(10),
+  AUC = numeric(10),
+  PR_AUC = numeric(10),
+  Brier = numeric(10),
+  LogLoss = numeric(10)
+)
+
+coef_list <- vector("list", 10)
+
+for (i in 1:10) {
+  test_idx  <- cv_folds[[i]]
+  train_idx <- setdiff(seq_len(nrow(data)), test_idx)
+  
+  X_train <- X[train_idx, ]
+  y_train <- y[train_idx]
+  
+  X_test  <- X[test_idx, ]
+  y_test  <- y[test_idx]
+  
+  
+  cvfit <- cv.grpreg(X_train, y_train,
+                     group = group,
+                     family = "binomial",
+                     penalty = "grLasso")
+  
+  lambda_min <- cvfit$lambda.min
+  fit <- cvfit$fit
+  
+  coef_list[[i]] <- coef(fit, lambda = lambda_min)
+  
+  preds <- predict(fit, X_test, type = "response", lambda = lambda_min)
+  eps <- 1e-15
+  preds <- pmin(pmax(preds, eps), 1 - eps)
+
+  pred_class <- ifelse(preds > 0.99, 1, 0)
+  cm <- table(Predicted = pred_class, Actual = y_test)
+  
+  TP <- cm["1","1"]; TN <- cm["0","0"]
+  FP <- cm["1","0"]; FN <- cm["0","1"]
+  
+  acc  <- (TP + TN) / sum(cm)
+  sens <- TP / (TP + FN)
+  spec <- TN / (TN + FP)
+  prec <- TP / (TP + FP)
+  f1   <- 2 * prec * sens / (prec + sens)
+  
+  roc_obj <- roc(y_test, preds)
+  auc_val <- auc(roc_obj)
+  
+  pr_obj <- PRROC::pr.curve(
+  scores.class0 = preds[y_test == 1],
+  scores.class1 = preds[y_test == 0],
+  curve = FALSE
+  )
+  pr_auc <- pr_obj$auc.integral
+  
+  
+  brier <- mean((preds - y_test)^2)
+  logloss <- -mean(y_test * log(preds) + (1 - y_test) * log(1 - preds))
+  
+  cv_results[i,] <- c(acc, sens, spec, prec, f1, auc_val, pr_auc, brier, logloss)
+}
+
+cv_summary_grLasso <- colMeans(cv_results, na.rm = TRUE)
+
+coef_mat <- do.call(cbind, coef_list)
+coef_summary_cv_grLasso <- data.frame(
+  Term   = rownames(coef_mat),
+  Mean   = rowMeans(coef_mat, na.rm = TRUE),
+  Median = apply(coef_mat, 1, median, na.rm = TRUE),
+  SD     = apply(coef_mat, 1, sd, na.rm = TRUE)
+)
+
+
+cv_summary_grLasso
+coef_summary_cv_grLasso 
+```
+
+### 1H.3 Reduced grSCAD Model's Cross-Validated Performance
+
+```{r reduced grSCAD CV}
+set.seed(123)
+
+data$SoilType   <- relevel(factor(data$SoilType), ref = "Loam")
+data$Lithology  <- relevel(factor(data$Lithology), ref = "Recent deposits")
+data$Aspect     <- relevel(factor(data$Aspect), ref = "North")
+
+X <- model.matrix(~ SoilType + Slope + Lithology + PGAComp, data = data)[, -1]
+y <- data$Landslide
+
+cols <- colnames(X)
+group <- integer(length(cols))
+group[grep("^Slope$", cols)]     <- 1
+group[grep("^PGAComp$", cols)]   <- 2
+group[grep("^Lithology", cols)]  <- 3
+group[grep("^SoilType", cols)]   <- 4
+
+# 10-fold CV
+cv_folds <- createFolds(y, k = 10, list = TRUE)
+
+cv_results <- data.frame(
+  Accuracy = numeric(10),
+  Sensitivity = numeric(10),
+  Specificity = numeric(10),
+  Precision = numeric(10),
+  F1 = numeric(10),
+  AUC = numeric(10),
+  PR_AUC = numeric(10),
+  Brier = numeric(10),
+  LogLoss = numeric(10)
+)
+
+coef_list <- vector("list", 10)
+
+for (i in 1:10) {
+  test_idx  <- cv_folds[[i]]
+  train_idx <- setdiff(seq_len(nrow(data)), test_idx)
+  
+  X_train <- X[train_idx, ]
+  y_train <- y[train_idx]
+  
+  X_test  <- X[test_idx, ]
+  y_test  <- y[test_idx]
+  
+  cvfit <- cv.grpreg(X_train, y_train,
+                     group = group,
+                     family = "binomial",
+                     penalty = "grSCAD")
+  
+  lambda_min <- cvfit$lambda.min
+  fit <- cvfit$fit
+  
+  coef_list[[i]] <- coef(fit, lambda = lambda_min)
+  
+  preds <- predict(fit, X_test, type = "response", lambda = lambda_min)
+  eps <- 1e-15
+  preds <- pmin(pmax(preds, eps), 1 - eps)
+
+  pred_class <- ifelse(preds > 0.51, 1, 0)
+  cm <- table(Predicted = pred_class, Actual = y_test)
+  
+  TP <- cm["1","1"]; TN <- cm["0","0"]
+  FP <- cm["1","0"]; FN <- cm["0","1"]
+  
+  acc  <- (TP + TN) / sum(cm)
+  sens <- TP / (TP + FN)
+  spec <- TN / (TN + FP)
+  prec <- TP / (TP + FP)
+  f1   <- 2 * prec * sens / (prec + sens)
+  
+  roc_obj <- roc(y_test, preds)
+  auc_val <- auc(roc_obj)
+  
+  pr_obj <- PRROC::pr.curve(
+  scores.class0 = preds[y_test == 1],
+  scores.class1 = preds[y_test == 0],
+  curve = FALSE
+  )
+  pr_auc <- pr_obj$auc.integral
+  
+  brier <- mean((preds - y_test)^2)
+  logloss <- -mean(y_test * log(preds) + (1 - y_test) * log(1 - preds))
+  
+  cv_results[i,] <- c(acc, sens, spec, prec, f1, auc_val, pr_auc, brier, logloss)
+}
+
+cv_summary_grSCAD <- colMeans(cv_results, na.rm = TRUE)
+
+coef_mat <- do.call(cbind, coef_list)
+coef_summary_cv_grSCAD <- data.frame(
+  Term   = rownames(coef_mat),
+  Mean   = rowMeans(coef_mat, na.rm = TRUE),
+  Median = apply(coef_mat, 1, median, na.rm = TRUE),
+  SD     = apply(coef_mat, 1, sd, na.rm = TRUE)
+)
+
+
+cv_summary_grSCAD
+coef_summary_cv_grSCAD 
+```
+
+## 2I Mapping
+
+### 2I.1 Map via LR model 
+```{r mapping and classification using reduced LR model}
+# standard logistic regression
+lr_model <- glm(Landslide ~ Elev + Slope + SoilType + Lithology + PGAComp,
+                data = data,
+                family = binomial)
+data$Prob <- predict(lr_model, newdata = data, type = "response")
+
+nc_boundary <- st_read("north_cotabato_gadm.shp")
+pts <- st_as_sf(data, coords = c("Long", "Lat"), crs = 4326)
+pts_joined <- st_join(pts, nc_boundary)
+pts_in_nc <- pts_joined[!is.na(pts_joined$NAME_1), ]   
+data_sp <- as(pts_in_nc, "Spatial")
+
+grd_sf <- st_make_grid(nc_boundary, cellsize = 0.001, what = "centers") # 0.001 is 100mX100m
+grd_sf <- st_intersection(grd_sf, nc_boundary)
+grd <- as(grd_sf, "Spatial")
+sp::gridded(grd) <- TRUE
+
+idw_result <- gstat::idw(Prob ~ 1, data_sp, newdata = grd)
+idw_raster <- raster(idw_result)
+
+
+# Classification with Jenks Natural Breaks 
+vals <- values(idw_raster)
+vals <- vals[!is.na(vals)]
+
+jenks <- classIntervals(vals, n = 5, style = "jenks")
+breaks <- jenks$brks
+
+classified <- cut(idw_raster,
+                  breaks = breaks,
+                  include.lowest = TRUE)
+
+class_labels <- c("Very Low", "Low", "Moderate", "High", "Very High")
+levels(classified) <- data.frame(ID = 1:5, Class = class_labels)
+
+my_colors1 <- c("#2DC937", "#99C140", "#E7B416", "#DB7B2B", "#CC3232")
+
+png("reduced_lr_LSM_data1.png", width = 1200, height = 900, res = 150)
+
+plot(classified,
+     col = my_colors1,
+     legend = FALSE,
+     main = "Landslide Susceptibility Map (Reduced LR)")
+
+plot(st_geometry(nc_boundary),
+     add = TRUE,
+     border = "black",
+     lwd = 1)
+
+legend("bottomleft",
+       legend = class_labels,
+       fill = my_colors1,
+       title = "Susceptibility",
+       bty = "o")
+
+dev.off()
+```
+
+### 2I.2 Map via grSCAD CV model
+```{r mapping and classification using reduced grSCAD CV model}
+X_grSCAD_reduced_lsm <- model.matrix(Landslide ~ Slope + PGAComp + Lithology + SoilType,
+                                     data = data)[, -1]
+
+cols <- colnames(X_grSCAD_reduced_lsm)
+
+group_grSCAD_reduced_lsm <- integer(length(cols))
+group_grSCAD_reduced_lsm[grep("^Slope$", cols)]    <- 1
+group_grSCAD_reduced_lsm[grep("^PGAComp$", cols)]  <- 2
+group_grSCAD_reduced_lsm[grep("^Lithology", cols)] <- 3
+group_grSCAD_reduced_lsm[grep("^SoilType", cols)]  <- 4
+
+# Group SCAD logistic regression with CV
+set.seed(123)
+cvfit_grSCAD_reduced_lsm <- cv.grpreg(
+  X_grSCAD_reduced_lsm, data$Landslide,
+  group   = group_grSCAD_reduced_lsm,
+  penalty = "grSCAD",
+  family  = "binomial",
+  seed    = 123
+)
+
+data$Prob <- predict(cvfit_grSCAD_reduced_lsm,
+                     X_grSCAD_reduced_lsm,
+                     type = "response",
+                     lambda = cvfit_grSCAD_reduced_lsm$lambda.min)
+
+nc_boundary <- st_read("north_cotabato_gadm.shp")
+pts <- st_as_sf(data, coords = c("Long", "Lat"), crs = 4326)
+pts_joined <- st_join(pts, nc_boundary)
+pts_in_nc <- pts_joined[!is.na(pts_joined$NAME_1), ]
+data_sp <- as(pts_in_nc, "Spatial")
+
+grd_sf <- st_make_grid(nc_boundary, cellsize = 0.001, what = "centers") # 0.001 is 100mX100m
+grd_sf <- st_intersection(grd_sf, nc_boundary)
+
+grd <- as(grd_sf, "Spatial")
+sp::gridded(grd) <- TRUE
+
+idw_result <- gstat::idw(Prob ~ 1, data_sp, newdata = grd)
+idw_raster <- raster(idw_result)
+
+
+# Classification with Jenks Natural Breaks
+vals <- values(idw_raster)
+vals <- vals[!is.na(vals)]
+
+jenks <- classIntervals(vals, n = 5, style = "jenks")
+breaks <- jenks$brks
+
+classified <- cut(idw_raster,
+                  breaks = breaks,
+                  include.lowest = TRUE)
+
+class_labels <- c("Very Low", "Low", "Moderate", "High", "Very High")
+levels(classified) <- data.frame(ID = 1:5, Class = class_labels)
+
+my_colors1 <- c("#2DC937", "#99C140", "#E7B416", "#DB7B2B", "#CC3232")
+
+png("reduced_grSCAD_LSM_data1.png", width = 1200, height = 900, res = 150)
+
+plot(classified,
+     col = my_colors1,
+     legend = FALSE,
+     main = "Landslide Susceptibility Map (Reduced SCAD)")
+
+plot(st_geometry(nc_boundary),
+     add = TRUE,
+     border = "black",
+     lwd = 1)
+
+legend("bottomleft",
+       legend = class_labels,
+       fill = my_colors1,
+       title = "Susceptibility",
+       bty = "o")
+
+dev.off()
+```
